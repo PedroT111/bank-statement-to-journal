@@ -124,7 +124,7 @@
 <div class="tabs">
   <button class="tab-btn active" data-tab="reglas">Reglas de clasificación</button>
   <button class="tab-btn" data-tab="cargar">Cargar extractos</button>
-  <button class="tab-btn" data-tab="asientos">Asientos del año</button>
+  <button class="tab-btn" data-tab="asientos">Asientos</button>
 </div>
 
 <!-- TAB: REGLAS -->
@@ -195,20 +195,34 @@
 
 <!-- TAB: ASIENTOS -->
 <div class="tab-panel" id="tab-asientos">
-  <h2 class="section-title">Asientos del año</h2>
-  <p class="section-desc">Un asiento resumen por mes (Enero a Diciembre), igual al formato que ya usás.</p>
+  <h2 class="section-title">Asientos</h2>
+  <p class="section-desc">Un asiento resumen por cada mes con movimientos cargados, igual al formato que ya usás.</p>
   <div style="display:flex; gap:12px; align-items:end; margin-bottom:16px; flex-wrap:wrap;">
-    <div class="field" style="width:140px;">
-      <label>Año</label>
-      <input type="number" id="anioInput" value="2026">
-    </div>
     <button class="btn btn-primary" id="generateBtn">Generar asientos (.zip)</button>
     <button class="btn btn-ghost" id="exportDetalleBtn">Exportar detalle (Excel)</button>
     <span class="hint" id="genStatus"></span>
   </div>
 
-  <select id="mesPreviewSelect" style="margin-bottom:10px; padding:8px 10px; border-radius:7px; border:1px solid var(--paper-line);"></select>
+  <div style="display:flex; gap:12px; align-items:end; margin-bottom:10px; flex-wrap:wrap;">
+    <select id="mesPreviewSelect" style="padding:8px 10px; border-radius:7px; border:1px solid var(--paper-line);"></select>
+    <div class="field" style="width:220px;">
+      <label>Saldo inicial Bancos (<span id="saldoInicialAnioLabel"></span>)</label>
+      <input type="number" step="0.01" id="saldoInicialInput">
+    </div>
+  </div>
   <div class="asiento-preview" id="asientoPreview">Cargá extractos para ver la vista previa.</div>
+  <div id="conciliacionBlock"></div>
+
+  <h2 class="section-title" style="margin-top:28px;">Conciliación bancaria por mes</h2>
+  <p class="section-desc">Saldo teórico de BANCOS según los asientos generados vs. saldo real informado por el extracto.</p>
+  <div class="card">
+    <div class="card-body" style="padding:0; max-height:480px; overflow:auto;">
+      <table class="data-table" id="conciliacionTable">
+        <thead><tr><th>Período</th><th>Teórico</th><th>Real (extracto)</th><th>Diferencia</th><th>Estado</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <input type="file" id="importJsonInputHidden" style="display:none;">
@@ -263,7 +277,8 @@ function defaultState(){
     reglas: SEED_REGLAS.map(r=>({id:rid++, ...r})),
     excluir: SEED_EXCLUIR.map((t,i)=>({id:i+1, texto:t})),
     corte: SEED_CORTE.map((t,i)=>({id:i+1, texto:t})),
-    anio: 2026,
+    saldoInicialBancos: {}, // { "2026": 1234567.89 } -> saldo BANCOS al 1/enero de ese año, editable a mano
+    saldosReales: {}, // { "2026-01": { "extracto_enero.pdf": 593682.75 } } -> saldo final real de cierre según el extracto, por período y archivo
     movimientos: {} // "YYYY-MM" -> [{fecha,concepto,tipo,monto,cuenta,incluido,origen}]
   };
 }
@@ -293,7 +308,12 @@ function saveState(){
 async function unlockAndLoad(password){
   appPassword = password;
   const result = await apiGet();
-  if(result.data){ state = result.data; if(!state.corte) state.corte = SEED_CORTE.map((t,i)=>({id:i+1,texto:t})); }
+  if(result.data){
+    state = result.data;
+    if(!state.corte) state.corte = SEED_CORTE.map((t,i)=>({id:i+1,texto:t}));
+    if(!state.saldoInicialBancos) state.saldoInicialBancos = {};
+    if(!state.saldosReales) state.saldosReales = {};
+  }
   else { state = defaultState(); await apiPost(state); }
   localStorage.setItem(PASSWORD_KEY, password);
 }
@@ -358,6 +378,11 @@ function parseStatementText(text, filename){
     if(excluirNorm.some(e=> e && normalizar(concepto).includes(e))){ runningSaldo = saldo; continue; }
     const { periodo, fechaTexto } = normalizeDate(m[1], yearHint);
     movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename });
+    if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
+    // TODO: si un mismo archivo trae varias cuentas bancarias (ej. cuenta en pesos y en dólares
+    // en el mismo PDF), esto se queda con el saldo de la ÚLTIMA cuenta procesada, no la suma de
+    // todas. Para una sola cuenta operativa por cooperativa no es un problema.
+    state.saldosReales[periodo][filename] = saldo;
     runningSaldo = saldo;
   }
   return movimientos;
@@ -573,8 +598,9 @@ dropzone.addEventListener('drop', e=>{ e.preventDefault(); dropzone.classList.re
 fileInput.addEventListener('change', e=>{ if(e.target.files.length) handleFiles([...e.target.files]); });
 
 /* ============ Generación de asientos ============ */
-function buildAsientoTexto(anio, mesIdx){
-  const key = `${anio}-${String(mesIdx+1).padStart(2,"0")}`;
+function buildAsientoTexto(key){
+  const [anioStr, moStr] = key.split("-");
+  const anio = parseInt(anioStr), mesIdx = parseInt(moStr)-1;
   const movs = (state.movimientos[key]||[]).filter(m=>m.incluido);
   if(movs.length===0) return null;
 
@@ -610,60 +636,140 @@ function buildAsientoTexto(anio, mesIdx){
   cuentasHaberOrdenadas.forEach(c=>{ out += `${c.padEnd(46,' ')} ${money(cuentasHaber[c])}\n`; });
   out += `\nTotal Debe:  ${money(totalDebe)}\n`;
   out += `Total Haber: ${money(totalHaber)}\n`;
-  return { texto: out, totalDebe, totalHaber, sinClasificar: movs.filter(m=>m.cuenta==='SIN CLASIFICAR').length };
+  return { texto: out, totalDebe, totalHaber, sinClasificar: movs.filter(m=>m.cuenta==='SIN CLASIFICAR').length, cuentasDebe, cuentasHaber };
 }
 
+/* ============ Conciliación bancaria ============ */
+function saldoTeoricoBancos(periodo){
+  const [anioStr, moStr] = periodo.split("-");
+  const hastaMesIdx = parseInt(moStr)-1;
+  let saldo = (state.saldoInicialBancos||{})[anioStr] || 0;
+  for(let m=0; m<=hastaMesIdx; m++){
+    const r = buildAsientoTexto(`${anioStr}-${String(m+1).padStart(2,"0")}`);
+    if(!r) continue;
+    saldo += (r.cuentasDebe['BANCOS']||0) - (r.cuentasHaber['BANCOS']||0);
+  }
+  return saldo;
+}
+function saldoRealBancos(periodo){
+  const porArchivo = (state.saldosReales||{})[periodo] || {};
+  return Object.values(porArchivo).reduce((a,b)=>a+b, 0);
+}
+
+function periodosConDatos(){
+  return Object.keys(state.movimientos).filter(k=>state.movimientos[k].length>0).sort();
+}
 function populateMesPreviewSelect(){
   const sel = document.getElementById('mesPreviewSelect');
-  const anio = parseInt(document.getElementById('anioInput').value)||new Date().getFullYear();
-  sel.innerHTML = MES_NOMBRES.map((m,i)=>{
-    const key = `${anio}-${String(i+1).padStart(2,"0")}`;
-    const has = state.movimientos[key] && state.movimientos[key].length>0;
-    return `<option value="${i}">${m} ${anio}${has?'':' (sin datos)'}</option>`;
+  const periodos = periodosConDatos();
+  const prevValue = sel.value;
+  sel.innerHTML = periodos.map(key=>{
+    const [y,mo] = key.split("-");
+    return `<option value="${key}">${MES_NOMBRES[parseInt(mo)-1]} ${y}</option>`;
   }).join("");
+  if(periodos.includes(prevValue)) sel.value = prevValue;
+  else if(periodos.length) sel.value = periodos[periodos.length-1];
 }
-function renderAsientoTab(){
-  populateMesPreviewSelect();
+function renderAsientoPreview(){
   const sel = document.getElementById('mesPreviewSelect');
-  const anio = parseInt(document.getElementById('anioInput').value)||new Date().getFullYear();
-  const mesIdx = parseInt(sel.value)||0;
-  const result = buildAsientoTexto(anio, mesIdx);
   const preview = document.getElementById('asientoPreview');
-  if(!result){ preview.textContent = "No hay movimientos cargados para este mes."; return; }
+  if(!sel.value){ preview.textContent = "Cargá extractos para ver la vista previa."; return; }
+  const result = buildAsientoTexto(sel.value);
+  if(!result){ preview.textContent = "No hay movimientos incluidos para este mes."; return; }
   let warn = "";
   if(Math.abs(result.totalDebe-result.totalHaber) > 0.02) warn += `\n⚠ Debe y Haber no coinciden (diferencia ${money(Math.abs(result.totalDebe-result.totalHaber))}).`;
   if(result.sinClasificar>0) warn += `\n⚠ ${result.sinClasificar} movimiento(s) sin clasificar — agregá una regla o asignales cuenta manualmente en "Cargar extractos".`;
   preview.textContent = result.texto + warn;
 }
-document.getElementById('anioInput').addEventListener('change', renderAsientoTab);
-document.getElementById('mesPreviewSelect').addEventListener('change', renderAsientoTab);
+function renderSaldoInicialInput(){
+  const sel = document.getElementById('mesPreviewSelect');
+  const input = document.getElementById('saldoInicialInput');
+  const label = document.getElementById('saldoInicialAnioLabel');
+  if(!sel.value){ input.value = ''; input.disabled = true; label.textContent = ''; return; }
+  const anio = sel.value.split('-')[0];
+  input.disabled = false;
+  label.textContent = anio;
+  input.value = (state.saldoInicialBancos||{})[anio] ?? '';
+}
+document.getElementById('saldoInicialInput').addEventListener('change', (e)=>{
+  const sel = document.getElementById('mesPreviewSelect');
+  if(!sel.value) return;
+  const anio = sel.value.split('-')[0];
+  state.saldoInicialBancos[anio] = parseFloat(e.target.value)||0;
+  saveState();
+  renderConciliacionBlock();
+  renderConciliacionTable();
+});
+function conciliacionResumen(periodo){
+  const teorico = saldoTeoricoBancos(periodo);
+  const real = saldoRealBancos(periodo);
+  const sinExtracto = real === 0;
+  const diferencia = sinExtracto ? null : Math.abs(teorico - real);
+  const ok = diferencia !== null && diferencia < 0.02;
+  return { teorico, real, sinExtracto, diferencia, ok };
+}
+function renderConciliacionBlock(){
+  const sel = document.getElementById('mesPreviewSelect');
+  const el = document.getElementById('conciliacionBlock');
+  if(!sel.value){ el.innerHTML = ''; return; }
+  const c = conciliacionResumen(sel.value);
+  if(c.sinExtracto){
+    el.innerHTML = `<p class="hint" style="margin-top:10px;">Sin extracto cargado para este mes — no se puede conciliar.</p>`;
+    return;
+  }
+  el.innerHTML = `<p style="margin-top:10px;">Conciliación BANCOS — Teórico: ${money(c.teorico)} · Real (extracto): ${money(c.real)} · Diferencia: ${money(c.diferencia)} <span class="badge ${c.ok?'ok':'warn'}">${c.ok?'✓':'⚠'}</span></p>`;
+}
+function renderConciliacionTable(){
+  const tbody = document.querySelector('#conciliacionTable tbody');
+  tbody.innerHTML = "";
+  periodosConDatos().forEach(key=>{
+    const [y,mo] = key.split("-");
+    const c = conciliacionResumen(key);
+    const tr = document.createElement('tr');
+    if(c.sinExtracto){
+      tr.innerHTML = `<td>${MES_NOMBRES[parseInt(mo)-1]} ${y}</td><td class="num">${money(c.teorico)}</td><td colspan="3" class="hint">Sin extracto cargado para este mes — no se puede conciliar.</td>`;
+    } else {
+      tr.innerHTML = `<td>${MES_NOMBRES[parseInt(mo)-1]} ${y}</td><td class="num">${money(c.teorico)}</td><td class="num">${money(c.real)}</td><td class="num">${money(c.diferencia)}</td><td><span class="badge ${c.ok?'ok':'warn'}">${c.ok?'✓ OK':'⚠ Revisar'}</span></td>`;
+    }
+    tbody.appendChild(tr);
+  });
+}
+function renderAsientoTab(){
+  populateMesPreviewSelect();
+  renderSaldoInicialInput();
+  renderAsientoPreview();
+  renderConciliacionBlock();
+  renderConciliacionTable();
+}
+document.getElementById('mesPreviewSelect').addEventListener('change', ()=>{
+  renderSaldoInicialInput();
+  renderAsientoPreview();
+  renderConciliacionBlock();
+});
 
 document.getElementById('generateBtn').addEventListener('click', async ()=>{
-  const anio = parseInt(document.getElementById('anioInput').value)||new Date().getFullYear();
   const status = document.getElementById('genStatus');
   const zip = new JSZip();
   let count = 0;
-  for(let mesIdx=0; mesIdx<12; mesIdx++){
-    const result = buildAsientoTexto(anio, mesIdx);
+  periodosConDatos().forEach(key=>{
+    const result = buildAsientoTexto(key);
     if(result){
-      const nombre = `asiento_${anio}_${String(mesIdx+1).padStart(2,"0")}.txt`;
-      zip.file(nombre, result.texto);
+      zip.file(`asiento_${key}.txt`, result.texto);
       count++;
     }
-  }
-  if(count===0){ alert("No hay movimientos cargados para ese año."); return; }
+  });
+  if(count===0){ alert("No hay movimientos cargados."); return; }
   status.textContent = "Generando...";
   const blob = await zip.generateAsync({type:"blob"});
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a'); a.href=url; a.download=`Asientos_${anio}.zip`;
+  const a = document.createElement('a'); a.href=url; a.download=`Asientos.zip`;
   document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
   status.textContent = `Listo — ${count} asientos generados.`;
 });
 
 document.getElementById('exportDetalleBtn').addEventListener('click', ()=>{
-  const anio = parseInt(document.getElementById('anioInput').value)||new Date().getFullYear();
   const rows = [["fecha","periodo","concepto","tipo","monto","cuenta","incluido","archivo_origen"]];
-  Object.keys(state.movimientos).filter(k=>k.startsWith(String(anio))).sort().forEach(key=>{
+  Object.keys(state.movimientos).sort().forEach(key=>{
     state.movimientos[key].forEach(m=>{
       rows.push([m.fecha, key, m.concepto, m.tipo, m.monto, m.cuenta, m.incluido?"SI":"NO", m.origen||""]);
     });
@@ -671,7 +777,7 @@ document.getElementById('exportDetalleBtn').addEventListener('click', ()=>{
   const wb = XLSX.utils.book_new();
   const ws = XLSX.utils.aoa_to_sheet(rows);
   XLSX.utils.book_append_sheet(wb, ws, "Detalle");
-  XLSX.writeFile(wb, `detalle_movimientos_${anio}.xlsx`);
+  XLSX.writeFile(wb, `detalle_movimientos.xlsx`);
 });
 
 /* ============ Tabs ============ */
@@ -712,7 +818,6 @@ function renderAll(){
   renderReglasTable();
   renderSimpleListTable('excluirTable','excluir');
   renderSimpleListTable('corteTable','corte');
-  document.getElementById('anioInput').value = state.anio || new Date().getFullYear();
   renderMonthGrid();
   renderAsientoTab();
 }
