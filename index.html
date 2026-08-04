@@ -278,7 +278,7 @@ function defaultState(){
     excluir: SEED_EXCLUIR.map((t,i)=>({id:i+1, texto:t})),
     corte: SEED_CORTE.map((t,i)=>({id:i+1, texto:t})),
     saldoInicialBancos: {}, // { "2026": 1234567.89 } -> saldo BANCOS al 1/enero de ese año, editable a mano
-    saldosReales: {}, // { "2026-01": { "extracto_enero.pdf": 593682.75 } } -> saldo final real de cierre según el extracto, por período y archivo
+    saldosReales: {}, // { "2026-01": { "extracto_enero.pdf": {saldo:593682.75, fechaOrd:"20260131"} } } -> saldo real de cierre por período y archivo; con una sola cuenta bancaria por cooperativa, se usa el de fechaOrd más reciente, nunca se suman archivos entre sí
     movimientos: {} // "YYYY-MM" -> [{fecha,concepto,tipo,monto,cuenta,incluido,origen}]
   };
 }
@@ -353,7 +353,7 @@ function actualizarSaldoReal(periodo, filename, fechaTexto, saldo, tracker){
   if(!prev || ordenable >= prev.fechaOrden){
     tracker[periodo] = { fechaOrden: ordenable, saldo };
     if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
-    state.saldosReales[periodo][filename] = saldo;
+    state.saldosReales[periodo][filename] = { saldo, fechaOrd: ordenable };
   }
 }
 function parseStatementText(text, filename){
@@ -547,7 +547,7 @@ function parseExcelRows(rows, filename){
     // bancarias, esto se queda con el saldo de una sola cuenta, no la suma de todas.
     Object.keys(maxFechaPorPeriodo).forEach(periodo=>{
       if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
-      state.saldosReales[periodo][filename] = maxFechaPorPeriodo[periodo].saldo;
+      state.saldosReales[periodo][filename] = { saldo: maxFechaPorPeriodo[periodo].saldo, fechaOrd: maxFechaPorPeriodo[periodo].ord };
     });
   }
 
@@ -773,7 +773,14 @@ function saldoTeoricoBancos(periodo){
 }
 function saldoRealBancos(periodo){
   const porArchivo = (state.saldosReales||{})[periodo] || {};
-  return Object.values(porArchivo).reduce((a,b)=>a+b, 0);
+  // Normaliza entradas viejas (guardadas antes de este cambio, un número suelto en vez de
+  // {saldo, fechaOrd}) tratándolas como la fecha más antigua posible, para que nunca ganen
+  // por sobre un archivo recién cargado con el formato nuevo.
+  const entradas = Object.values(porArchivo).map(e => (e && typeof e === 'object') ? e : { saldo: e, fechaOrd: "00000000" });
+  if(entradas.length === 0) return null; // sin dato, no "0"
+  // Con una sola cuenta bancaria por cooperativa, el saldo real del período es el de la
+  // fecha más reciente encontrada — nunca se suman archivos entre sí.
+  return entradas.reduce((mejor, e) => (!mejor || (e.fechaOrd||"00000000") > (mejor.fechaOrd||"00000000")) ? e : mejor, null).saldo;
 }
 
 function periodosConDatos(){
@@ -823,7 +830,7 @@ document.getElementById('saldoInicialInput').addEventListener('change', (e)=>{
 function conciliacionResumen(periodo){
   const teorico = saldoTeoricoBancos(periodo);
   const real = saldoRealBancos(periodo);
-  const sinExtracto = real === 0;
+  const sinExtracto = real === null;
   const diferencia = sinExtracto ? null : Math.abs(teorico - real);
   const ok = diferencia !== null && diferencia < 0.02;
   return { teorico, real, sinExtracto, diferencia, ok };
