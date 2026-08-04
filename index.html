@@ -279,6 +279,7 @@ function defaultState(){
     corte: SEED_CORTE.map((t,i)=>({id:i+1, texto:t})),
     saldoInicialBancos: {}, // { "2026": 1234567.89 } -> saldo BANCOS al 1/enero de ese año, editable a mano
     saldosReales: {}, // { "2026-01": { "extracto_enero.pdf": {saldo:593682.75, fechaOrd:"20260131"} } } -> saldo real de cierre por período y archivo; con una sola cuenta bancaria por cooperativa, se usa el de fechaOrd más reciente, nunca se suman archivos entre sí
+    archivosImportados: {}, // { "extracto_enero.pdf": true } -> qué archivos ya se importaron, para evitar reimportarlos sin querer
     movimientos: {} // "YYYY-MM" -> [{fecha,concepto,tipo,monto,cuenta,incluido,origen}]
   };
 }
@@ -313,6 +314,7 @@ async function unlockAndLoad(password){
     if(!state.corte) state.corte = SEED_CORTE.map((t,i)=>({id:i+1,texto:t}));
     if(!state.saldoInicialBancos) state.saldoInicialBancos = {};
     if(!state.saldosReales) state.saldosReales = {};
+    if(!state.archivosImportados) state.archivosImportados = {};
   }
   else { state = defaultState(); await apiPost(state); }
   localStorage.setItem(PASSWORD_KEY, password);
@@ -423,9 +425,7 @@ function mergeMovimientos(nuevos){
     const tipoFinal = mov.tipo; // la dirección real (por delta de saldo) siempre manda; el "tipo" de la regla es solo referencia
     const item = { fecha:mov.fecha, concepto:mov.concepto, tipo:tipoFinal, monto:mov.monto, cuenta:cls.cuenta, incluido:true, origen:mov.origen };
     if(!state.movimientos[mov.periodo]) state.movimientos[mov.periodo] = [];
-    // evitar duplicados exactos (mismo archivo ya importado)
-    const dup = state.movimientos[mov.periodo].some(x=> x.fecha===item.fecha && x.concepto===item.concepto && Math.abs(x.monto-item.monto)<0.01 && x.tipo===item.tipo);
-    if(!dup) state.movimientos[mov.periodo].push(item);
+    state.movimientos[mov.periodo].push(item);
   });
 }
 
@@ -557,6 +557,14 @@ function parseExcelRows(rows, filename){
 async function handleFiles(files){
   const status = document.getElementById('parseStatus');
   for(const file of files){
+    if(state.archivosImportados[file.name]){
+      const reimportar = confirm(`"${file.name}" ya fue cargado antes. ¿Volver a importarlo? (esto va a borrar y reemplazar sus movimientos anteriores)`);
+      if(!reimportar){ continue; }
+      // Borrar movimientos previos de este archivo en TODOS los períodos antes de re-agregar
+      Object.keys(state.movimientos).forEach(periodo=>{
+        state.movimientos[periodo] = state.movimientos[periodo].filter(m => m.origen !== file.name);
+      });
+    }
     status.textContent = `Procesando ${file.name}...`;
     try{
       let movs;
@@ -577,6 +585,7 @@ async function handleFiles(files){
         }
       }
       mergeMovimientos(movs);
+      state.archivosImportados[file.name] = true;
       status.textContent = `${file.name}: ${movs.length} movimientos detectados.`;
     }catch(e){
       console.error(e);
@@ -703,7 +712,13 @@ function renderMonthDetail(key){
 document.getElementById('clearMonthBtn').addEventListener('click', ()=>{
   if(!currentMonthKey) return;
   if(confirm(`¿Vaciar todos los movimientos de ${currentMonthKey}?`)){
+    const archivosDelMes = new Set((state.movimientos[currentMonthKey]||[]).map(m=>m.origen));
     delete state.movimientos[currentMonthKey];
+    delete state.saldosReales[currentMonthKey];
+    archivosDelMes.forEach(nombre=>{
+      const siguePresente = Object.values(state.movimientos).some(arr => arr.some(m=>m.origen===nombre));
+      if(!siguePresente) delete state.archivosImportados[nombre];
+    });
     saveState(); renderMonthGrid(); document.getElementById('monthDetailCard').style.display='none'; renderAsientoTab();
   }
 });
