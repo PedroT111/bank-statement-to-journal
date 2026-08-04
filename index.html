@@ -487,8 +487,7 @@ function parseExcelRows(rows, filename){
   const corteNorm = state.corte.map(c=>normalizar(c.texto)).filter(Boolean);
   const excluirNorm = state.excluir.map(c=>normalizar(c.texto)).filter(Boolean);
 
-  const movimientos = [];
-  const fechaMaxPorPeriodo = {}; // periodo -> {fechaOrden: "YYYYMMDD", saldo: number}
+  const movimientosRaw = []; // incluye saldoShown temporalmente, para detectar el orden del archivo después del loop
   let corte = false;
   for(let i=headerIdx+1; i<rows.length; i++){
     if(corte) break;
@@ -519,14 +518,40 @@ function parseExcelRows(rows, filename){
     const dateStr = `${dm[1]}/${dm[2]}${dm[3] ? '/'+dm[3] : ''}`;
     const { periodo, fechaTexto } = normalizeDate(dateStr, yearHint);
 
-    movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename });
-    if(colSaldo>=0 && row[colSaldo]!=null && row[colSaldo]!=="" && !isNaN(Number(row[colSaldo]))){
-      // TODO: mismo límite que en parseStatementText — si el archivo trae varias cuentas
-      // bancarias, esto se queda con el saldo de la última fecha de UNA cuenta, no la suma de todas.
-      actualizarSaldoReal(periodo, filename, fechaTexto, Number(row[colSaldo]), fechaMaxPorPeriodo);
-    }
+    const saldoShown = (colSaldo>=0 && row[colSaldo]!=null && row[colSaldo]!=="" && !isNaN(Number(row[colSaldo]))) ? Number(row[colSaldo]) : null;
+    movimientosRaw.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename, saldoShown });
   }
-  return movimientos;
+
+  // Detectar si el archivo viene ascendente o descendente por fecha, y elegir en consecuencia
+  // qué fila de cada fecha representa el saldo real al cierre de ese día. Algunos bancos (ej.
+  // Banco Julio) listan del más nuevo al más viejo Y el "Saldo" de cada fila es el saldo ANTES
+  // de esa fila — con eso, la fila correcta por fecha es la PRIMERA del archivo, no la última.
+  if(movimientosRaw.length >= 2){
+    const ordenable = f => { const [d,m,y] = f.split("/"); return `${y}${m.padStart(2,"0")}${d.padStart(2,"0")}`; };
+    const primera = ordenable(movimientosRaw[0].fecha);
+    const ultima = ordenable(movimientosRaw[movimientosRaw.length-1].fecha);
+    const descendente = primera > ultima;
+
+    const maxFechaPorPeriodo = {};
+    movimientosRaw.forEach(m=>{
+      if(m.saldoShown==null || isNaN(m.saldoShown)) return;
+      const ord = ordenable(m.fecha);
+      const prev = maxFechaPorPeriodo[m.periodo];
+      // Actualizar si es una fecha más nueva, O si es la misma fecha pero el archivo es
+      // ascendente (ahí sí queremos quedarnos con la ÚLTIMA fila de esa fecha).
+      if(!prev || ord > prev.ord || (ord === prev.ord && !descendente)){
+        maxFechaPorPeriodo[m.periodo] = { ord, saldo: m.saldoShown };
+      }
+    });
+    // TODO: mismo límite que en parseStatementText — si el archivo trae varias cuentas
+    // bancarias, esto se queda con el saldo de una sola cuenta, no la suma de todas.
+    Object.keys(maxFechaPorPeriodo).forEach(periodo=>{
+      if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
+      state.saldosReales[periodo][filename] = maxFechaPorPeriodo[periodo].saldo;
+    });
+  }
+
+  return movimientosRaw.map(({saldoShown, ...m}) => m);
 }
 
 async function handleFiles(files){
