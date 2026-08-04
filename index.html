@@ -343,10 +343,24 @@ function normalizeDate(dateStr, yearHint){
   if(y.length===2) y = "20"+y;
   return { periodo: `${y}-${mo.padStart(2,"0")}`, fechaTexto: `${d}/${mo}/${y}` };
 }
+// Guarda el saldo real de cierre del período, quedándose con el de la fecha MÁS RECIENTE
+// vista hasta ahora — funciona sin importar si el archivo viene ordenado ascendente o
+// descendente por fecha (algunos bancos listan del movimiento más nuevo al más viejo).
+function actualizarSaldoReal(periodo, filename, fechaTexto, saldo, tracker){
+  const [d,m,y] = fechaTexto.split("/");
+  const ordenable = `${y}${m.padStart(2,"0")}${d.padStart(2,"0")}`;
+  const prev = tracker[periodo];
+  if(!prev || ordenable >= prev.fechaOrden){
+    tracker[periodo] = { fechaOrden: ordenable, saldo };
+    if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
+    state.saldosReales[periodo][filename] = saldo;
+  }
+}
 function parseStatementText(text, filename){
   const yearHint = extractYearFromHeader(text);
   const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
   let runningSaldo = null;
+  const fechaMaxPorPeriodo = {}; // periodo -> {fechaOrden: "YYYYMMDD", saldo: number}
   const movimientos = [];
   let corte = false;
   const corteNorm = state.corte.map(c=>normalizar(c.texto)).filter(Boolean);
@@ -378,11 +392,10 @@ function parseStatementText(text, filename){
     if(excluirNorm.some(e=> e && normalizar(concepto).includes(e))){ runningSaldo = saldo; continue; }
     const { periodo, fechaTexto } = normalizeDate(m[1], yearHint);
     movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename });
-    if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
     // TODO: si un mismo archivo trae varias cuentas bancarias (ej. cuenta en pesos y en dólares
-    // en el mismo PDF), esto se queda con el saldo de la ÚLTIMA cuenta procesada, no la suma de
-    // todas. Para una sola cuenta operativa por cooperativa no es un problema.
-    state.saldosReales[periodo][filename] = saldo;
+    // en el mismo PDF), esto se queda con el saldo de la última fecha procesada de UNA cuenta,
+    // no la suma de todas. Para una sola cuenta operativa por cooperativa no es un problema.
+    actualizarSaldoReal(periodo, filename, fechaTexto, saldo, fechaMaxPorPeriodo);
     runningSaldo = saldo;
   }
   return movimientos;
@@ -394,7 +407,12 @@ function clasificar(concepto){
   const reglasOrdenadas = [...state.reglas].sort((a,b)=> (a.prioridad??0) - (b.prioridad??0));
   for(const r of reglasOrdenadas){
     const kw = normalizar(r.palabra_clave);
-    if(kw && cNorm.includes(kw)) return { cuenta: r.cuenta, tipo: r.tipo_movimiento };
+    if(!kw) continue;
+    const escaped = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // la palabra clave debe empezar en un límite de palabra (inicio de texto o carácter no alfanumérico antes),
+    // pero puede matchear como PREFIJO de una palabra más larga (ej. "TRANSF" dentro de "TRANSFERENCIA")
+    const re = new RegExp('(^|[^a-z0-9áéíóúñ])' + escaped, 'i');
+    if(re.test(cNorm)) return { cuenta: r.cuenta, tipo: r.tipo_movimiento };
   }
   return { cuenta: "SIN CLASIFICAR", tipo: null };
 }
@@ -470,6 +488,7 @@ function parseExcelRows(rows, filename){
   const excluirNorm = state.excluir.map(c=>normalizar(c.texto)).filter(Boolean);
 
   const movimientos = [];
+  const fechaMaxPorPeriodo = {}; // periodo -> {fechaOrden: "YYYYMMDD", saldo: number}
   let corte = false;
   for(let i=headerIdx+1; i<rows.length; i++){
     if(corte) break;
@@ -501,11 +520,10 @@ function parseExcelRows(rows, filename){
     const { periodo, fechaTexto } = normalizeDate(dateStr, yearHint);
 
     movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename });
-    if(colSaldo>=0 && row[colSaldo]!=null && row[colSaldo]!==""){
-      if(!state.saldosReales[periodo]) state.saldosReales[periodo] = {};
+    if(colSaldo>=0 && row[colSaldo]!=null && row[colSaldo]!=="" && !isNaN(Number(row[colSaldo]))){
       // TODO: mismo límite que en parseStatementText — si el archivo trae varias cuentas
-      // bancarias, esto se queda con el saldo de la última fila procesada, no la suma de todas.
-      state.saldosReales[periodo][filename] = Number(row[colSaldo]);
+      // bancarias, esto se queda con el saldo de la última fecha de UNA cuenta, no la suma de todas.
+      actualizarSaldoReal(periodo, filename, fechaTexto, Number(row[colSaldo]), fechaMaxPorPeriodo);
     }
   }
   return movimientos;
