@@ -1,5 +1,7 @@
 {
   "functions": {
-    "api/state.js": { "runtime": "nodejs22.x" }
+    "api/state.js": {
+      "maxDuration": 60
+    }
   }
 }
