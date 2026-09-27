@@ -364,7 +364,9 @@ function actualizarSaldoReal(periodo, filename, fechaTexto, saldo, tracker){
     state.saldosReales[periodo][filename] = { saldo, fechaOrd: ordenable };
   }
 }
-function parseStatementText(text, filename){
+// `stats` (opcional) cuenta las filas cuyo importe impreso no coincide con el delta de saldo:
+// en texto nativo del PDF casi nunca pasa, pero en texto de OCR delata dígitos mal leídos.
+function parseStatementText(text, filename, stats){
   const yearHint = extractYearFromHeader(text);
   const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
   let runningSaldo = null;
@@ -419,6 +421,10 @@ function parseStatementText(text, filename){
     if(Math.abs(delta) < 0.005){ runningSaldo = saldo; continue; } // sin cambio de saldo, ignorar
     const tipo = delta >= 0 ? "CREDITO" : "DEBITO";
     const monto = Math.abs(delta);
+    if(stats && nums.length >= 2){
+      stats.filas = (stats.filas||0) + 1;
+      if(Math.abs(Math.abs(parseMoneyTok(nums[nums.length-2])) - monto) > 0.005) stats.descuadres = (stats.descuadres||0) + 1;
+    }
     let concepto = rest.replace(MONEY_RE, " ").replace(/\s+\d{6,}\s*/g, " ").replace(/\s+/g," ").trim();
     if(excluirNorm.some(e=> e && normalizar(concepto).includes(e))){ runningSaldo = saldo; continue; }
     const { periodo, fechaTexto } = normalizeDate(m[1], yearHint);
@@ -484,6 +490,51 @@ async function extractPdfText(arrayBuffer){
     }
     fullText += line + "\n";
     fullText += PAGE_BREAK_MARK + "\n";
+  }
+  return fullText;
+}
+
+// PDFs escaneados (ej. resúmenes viejos de Bancor impresos y vueltos a escanear) no traen capa
+// de texto: pdf.js devuelve solo el marcador de página y el parser no encuentra movimientos.
+function pdfSinTexto(text){
+  return text.split("\n").every(l => !l.trim() || l.trim() === PAGE_BREAK_MARK);
+}
+
+let tesseractCargado = null;
+function cargarTesseract(){
+  if(!tesseractCargado){
+    tesseractCargado = new Promise((resolve, reject)=>{
+      const s = document.createElement("script");
+      s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js";
+      s.onload = resolve;
+      s.onerror = () => { tesseractCargado = null; reject(new Error("no se pudo cargar el OCR (tesseract.js)")); };
+      document.head.appendChild(s);
+    });
+  }
+  return tesseractCargado;
+}
+
+async function extractPdfTextOCR(arrayBuffer, onProgress){
+  await cargarTesseract();
+  const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+  const worker = await Tesseract.createWorker("spa");
+  // PSM 6 = "un solo bloque de texto uniforme": mantiene cada fila de la tabla (fecha, concepto,
+  // débito, crédito, saldo) en una sola línea, en vez de separar las columnas en bloques.
+  await worker.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1" });
+  let fullText = "";
+  try{
+    for(let p=1; p<=pdf.numPages; p++){
+      onProgress && onProgress(p, pdf.numPages);
+      const page = await pdf.getPage(p);
+      const viewport = page.getViewport({ scale: 3 });
+      const canvas = document.createElement("canvas");
+      canvas.width = viewport.width; canvas.height = viewport.height;
+      await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+      const { data } = await worker.recognize(canvas);
+      fullText += data.text + "\n" + PAGE_BREAK_MARK + "\n";
+    }
+  } finally {
+    await worker.terminate();
   }
   return fullText;
 }
@@ -596,6 +647,10 @@ function parseExcelRows(rows, filename){
 async function handleFiles(files){
   const status = document.getElementById('parseStatus');
   for(const file of files){
+    // Un archivo marcado como importado pero sin ningún movimiento (ej. un escaneo leído antes de
+    // que existiera el OCR) no cuenta como cargado: se reimporta sin preguntar.
+    const tieneMovimientos = Object.values(state.movimientos).some(ms => ms.some(m => m.origen === file.name));
+    if(state.archivosImportados[file.name] && !tieneMovimientos) delete state.archivosImportados[file.name];
     if(state.archivosImportados[file.name]){
       const reimportar = confirm(`"${file.name}" ya fue cargado antes. ¿Volver a importarlo? (esto va a borrar y reemplazar sus movimientos anteriores)`);
       if(!reimportar){ continue; }
@@ -606,11 +661,23 @@ async function handleFiles(files){
     }
     status.textContent = `Procesando ${file.name}...`;
     try{
-      let movs;
+      let movs, avisoOCR = "";
       if(/\.pdf$/i.test(file.name)){
         const buf = await file.arrayBuffer();
-        const text = await extractPdfText(buf);
-        movs = parseStatementText(text, file.name);
+        // pdf.js transfiere (vacía) el buffer que recibe, así que cada lectura usa su propia copia
+        let text = await extractPdfText(buf.slice(0));
+        if(pdfSinTexto(text)){
+          text = await extractPdfTextOCR(buf.slice(0), (p, n) => {
+            status.textContent = `${file.name} es un escaneo sin texto — leyendo con OCR (página ${p} de ${n})...`;
+          });
+          const stats = {};
+          movs = parseStatementText(text, file.name, stats);
+          avisoOCR = stats.descuadres
+            ? ` Leído con OCR: ${stats.descuadres} fila(s) con importe que no cuadra con el saldo — revisalas.`
+            : " Leído con OCR — conviene revisar los importes.";
+        } else {
+          movs = parseStatementText(text, file.name);
+        }
       } else {
         const buf = await file.arrayBuffer();
         const wb = XLSX.read(buf, {type:"array", cellDates:true});
@@ -623,9 +690,15 @@ async function handleFiles(files){
           movs = parseStatementText(text, file.name);
         }
       }
+      if(movs.length === 0){
+        // No marcar como importado: si no, la próxima vez aparece como "ya fue cargado"
+        // sin haber aportado nada, y el archivo queda bloqueado.
+        status.textContent = `${file.name}: no se detectaron movimientos. El archivo no se marcó como cargado.`;
+        continue;
+      }
       mergeMovimientos(movs);
       state.archivosImportados[file.name] = true;
-      status.textContent = `${file.name}: ${movs.length} movimientos detectados.`;
+      status.textContent = `${file.name}: ${movs.length} movimientos detectados.${avisoOCR}`;
     }catch(e){
       console.error(e);
       status.textContent = `Error procesando ${file.name}: ${e.message}`;
