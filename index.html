@@ -364,6 +364,9 @@ function actualizarSaldoReal(periodo, filename, fechaTexto, saldo, tracker){
     state.saldosReales[periodo][filename] = { saldo, fechaOrd: ordenable };
   }
 }
+function limpiarConcepto(rest){
+  return rest.replace(/§[DCS]§/g, " ").replace(MONEY_RE, " ").replace(/\s+\d{6,}\s*/g, " ").replace(/\s+/g," ").trim();
+}
 // `stats` (opcional) cuenta las filas cuyo importe impreso no coincide con el delta de saldo:
 // en texto nativo del PDF casi nunca pasa, pero en texto de OCR delata dígitos mal leídos.
 function parseStatementText(text, filename, stats){
@@ -404,7 +407,26 @@ function parseStatementText(text, filename, stats){
     const rest = m[2];
     const nums = rest.match(MONEY_RE);
     if(!nums || nums.length===0) continue;
-    const saldo = parseMoneyTok(nums[nums.length-1]);
+
+    // Importes etiquetados por columna (ver etiquetarMonto). Si la fila no trae saldo pero sí
+    // un débito o crédito, el importe y la dirección salen de la columna, no de un delta.
+    const etiquetas = {};
+    for(const t of rest.matchAll(/§([DCS])§(-?\d{1,3}(?:\.\d{3})*,\d{2})/g)) etiquetas[t[1]] = parseMoneyTok(t[2]);
+    if(etiquetas.S === undefined && (etiquetas.D !== undefined || etiquetas.C !== undefined)){
+      const credito = Math.abs(etiquetas.C || 0), debito = Math.abs(etiquetas.D || 0);
+      const neto = +(credito - debito).toFixed(2);
+      if(Math.abs(neto) < 0.005) continue;
+      const concepto = limpiarConcepto(rest);
+      const nuevoSaldo = runningSaldo === null ? null : +(runningSaldo + neto).toFixed(2);
+      if(nuevoSaldo !== null) runningSaldo = nuevoSaldo;
+      if(excluirNorm.some(e=> e && normalizar(concepto).includes(e))) continue;
+      const { periodo, fechaTexto } = normalizeDate(m[1], yearHint);
+      movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo: neto > 0 ? "CREDITO" : "DEBITO", monto: Math.abs(neto), origen: filename });
+      if(nuevoSaldo !== null) actualizarSaldoReal(periodo, filename, fechaTexto, nuevoSaldo, fechaMaxPorPeriodo);
+      continue;
+    }
+
+    const saldo = etiquetas.S !== undefined ? etiquetas.S : parseMoneyTok(nums[nums.length-1]);
     if(runningSaldo===null){
       if(candidatosSaldoInicial.length){
         // Nos quedamos con el candidato más cercano al saldo de esta primera fila: el saldo de
@@ -425,7 +447,7 @@ function parseStatementText(text, filename, stats){
       stats.filas = (stats.filas||0) + 1;
       if(Math.abs(Math.abs(parseMoneyTok(nums[nums.length-2])) - monto) > 0.005) stats.descuadres = (stats.descuadres||0) + 1;
     }
-    let concepto = rest.replace(MONEY_RE, " ").replace(/\s+\d{6,}\s*/g, " ").replace(/\s+/g," ").trim();
+    const concepto = limpiarConcepto(rest);
     if(excluirNorm.some(e=> e && normalizar(concepto).includes(e))){ runningSaldo = saldo; continue; }
     const { periodo, fechaTexto } = normalizeDate(m[1], yearHint);
     movimientos.push({ fecha: fechaTexto, periodo, concepto, tipo, monto, origen: filename });
@@ -470,6 +492,7 @@ if(window['pdfjsLib']){ pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.
 async function extractPdfText(arrayBuffer){
   const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
   let fullText = "";
+  columnasMonto = null;
   for(let p=1; p<=pdf.numPages; p++){
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
@@ -482,16 +505,49 @@ async function extractPdfText(arrayBuffer){
       if(Math.abs(dy) > 2) return dy;
       return a.transform[4] - b.transform[4];
     });
-    let lastY = null, line = "";
+    const filas = [];
+    let lastY = null;
     for(const item of items){
-      if(lastY!==null && Math.abs(item.transform[5]-lastY) > 2){ fullText += line + "\n"; line = ""; }
-      line += item.str + " ";
+      if(lastY===null || Math.abs(item.transform[5]-lastY) > 2) filas.push([]);
+      filas[filas.length-1].push(item);
       lastY = item.transform[5];
     }
-    fullText += line + "\n";
+    for(const fila of filas){
+      // Si la fila es el encabezado de la tabla (Débito / Crédito / Saldo), guardamos la
+      // posición horizontal de cada columna para esta página y las siguientes.
+      const cols = detectarColumnasMonto(fila);
+      if(cols) columnasMonto = cols;
+      fullText += fila.map(item => etiquetarMonto(item, columnasMonto)).join(" ") + "\n";
+    }
     fullText += PAGE_BREAK_MARK + "\n";
   }
   return fullText;
+}
+
+// Algunos bancos (ej. Credicoop) NO imprimen el saldo en cada fila: la columna "Saldo" queda
+// vacía salvo en "Saldo anterior" / "Saldo al". Sin saber de qué columna viene cada número, el
+// parser tomaría el importe del movimiento como si fuera el saldo y calcularía deltas sin
+// sentido. Por eso, cuando el PDF tiene un encabezado con columnas Débito/Crédito/Saldo,
+// etiquetamos cada importe con su columna según su posición X: "§D§1.234,56", "§C§...", "§S§...".
+let columnasMonto = null;
+const MONTO_ITEM_RE = /^\$?\s*-?\d{1,3}(?:\.\d{3})*,\d{2}-?$/;
+function centroX(item){ return item.transform[4] + (item.width||0)/2; }
+function detectarColumnasMonto(fila){
+  const buscar = re => fila.find(it => re.test(normalizar(it.str).trim()));
+  const deb = buscar(/^debitos?$/), cred = buscar(/^creditos?$/), sal = buscar(/^saldos?$/);
+  if(!deb || !cred || !sal) return null;
+  return [["D", centroX(deb)], ["C", centroX(cred)], ["S", centroX(sal)]].sort((a,b)=>a[1]-b[1]);
+}
+function etiquetarMonto(item, cols){
+  const s = item.str.trim();
+  if(!cols || !MONTO_ITEM_RE.test(s)) return item.str;
+  const x = centroX(item);
+  // Límite izquierdo: medio espacio entre columnas a la izquierda de la primera. Un número
+  // más a la izquierda (ej. dentro de la descripción) no pertenece a ninguna columna de montos.
+  const margen = (cols[1][1] - cols[0][1]) / 2;
+  if(x < cols[0][1] - margen) return item.str;
+  const col = cols.reduce((mejor, c) => Math.abs(c[1]-x) < Math.abs(mejor[1]-x) ? c : mejor);
+  return `§${col[0]}§${s}`;
 }
 
 // PDFs escaneados (ej. resúmenes viejos de Bancor impresos y vueltos a escanear) no traen capa
